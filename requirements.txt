@@ -1,28 +1,50 @@
 # =============================================================================
-# sqmg_project-qiskit — 環境依賴
-# conda 環境名稱: qmg_qpso
-# Python: >= 3.12（QMG 官方要求）
+# sqmg_project-cudaq — 環境依賴（CUDA-Q 版）
+# conda 環境名稱: qmg_cudaq
+# Python: >= 3.10（CUDA-Q 要求）
+# CUDA:   >= 11.8（V100 compute capability 7.0）
 # =============================================================================
-# 注意：此專案的 numpy >= 2.1.1，與 Project 1（CUDA-Q，numpy<2.0）環境完全分離。
+# 安裝順序：
+#   1. conda create -n qmg_cudaq python=3.10
+#   2. conda activate qmg_cudaq
+#   3. pip install cuda-quantum          # CUDA-Q 主套件（含 CPU 模擬）
+#   4. pip install cuda-quantum-cu11     # V100 GPU 支援（CUDA 11.x）
+#      或 pip install cuda-quantum-cu12  # 若已安裝 CUDA 12
+#   5. pip install -r requirements.txt
 # =============================================================================
 
-# ── Qiskit 核心（對應 QMG README 指定版本）──────────────────────────────────
-qiskit>=1.2.4
-qiskit-aer>=0.15.1
-qiskit-ibm-runtime>=0.30.0
-qiskit-qasm3-import>=0.5.0
+# ── CUDA-Q（取代 Qiskit，這是核心變更）──────────────────────────────────────
+# 從 PyPI 安裝：pip install cuda-quantum
+# GPU 版本（V100 需要 CUDA 11.8 以上）：
+#   pip install cuda-quantum-cu11   （CUDA 11.x）
+#   pip install cuda-quantum-cu12   （CUDA 12.x）
+# 注意：cudaq 套件不在 requirements.txt 中直接列出，需手動安裝 GPU 版本
+# cudaq>=0.8.0   # 手動安裝，見上方說明
 
-# ── 化學/分子生成 ─────────────────────────────────────────────────────────────
+# ── 化學/分子生成（保持不變）──────────────────────────────────────────────────
 rdkit>=2024.3.5
 
-# ── 數值計算（QMG 需要 numpy >= 2.1.1）──────────────────────────────────────
+# ── 數值計算（CUDA-Q 不限制 numpy 版本，保持 >= 2.1.1）──────────────────────
 numpy>=2.1.1
 pandas>=2.2.3
 
 # ── 視覺化 ───────────────────────────────────────────────────────────────────
 matplotlib>=3.9.2
 seaborn>=0.13
-pylatexenc>=2.10   # Qiskit 電路繪圖依賴
 
-# ── 機器學習（選用，供未來與 BO 做 ablation study）───────────────────────────
+# ── 機器學習（供 ablation study）──────────────────────────────────────────────
 scikit-learn>=1.5
+
+# =============================================================================
+# 已移除的 Qiskit 套件（CUDA-Q 版不再需要）：
+#   qiskit>=1.2.4
+#   qiskit-aer>=0.15.1
+#   qiskit-ibm-runtime>=0.30.0
+#   qiskit-qasm3-import>=0.5.0
+#   pylatexenc>=2.10
+# =============================================================================
+# V100 GPU 快速設定（8-GPU 機器）：
+#   cudaq.set_target("nvidia")       # 單 GPU（最穩定）
+#   cudaq.set_target("nvidia-mqpu")  # 多 GPU（自動分配 shots 到 8 張 V100）
+#   cudaq.set_target("qpp-cpu")      # CPU fallback（無 GPU 時用此）
+# =============================================================================
