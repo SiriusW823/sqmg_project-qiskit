@@ -1,6 +1,14 @@
 from rdkit import Chem
 from rdkit.Chem import Descriptors
-from rdkit.Contrib.SA_Score import sascorer
+import warnings
+
+# rdkit 2026.03.1 的 sascorer 內部已改用 rdFingerprintGenerator，
+# 但在舊版路徑或中間版本可能印出 DEPRECATION WARNING。
+# 此 import 對 conda-forge 版 rdkit 正常可用。
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    from rdkit.Contrib.SA_Score import sascorer
+
 from rdkit.Chem.Crippen import MolLogP, MolMR
 import numpy as np
 from typing import List
