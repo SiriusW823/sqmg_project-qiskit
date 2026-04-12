@@ -1,14 +1,15 @@
 """
 ==============================================================================
-run_qpso_qmg_cudaq.py  ─ CUDA-Q + SOQPSO 主入口（完整修正版）
+run_qpso_qmg_cudaq.py  ─ CUDA-Q 0.7.1 + SOQPSO 主入口（完整修正版）
 ==============================================================================
 修正清單：
   [FIX-1] import 路徑改為 qmg.utils（配合 qmg/utils/ 套件目錄）
   [FIX-2] evaluate_fn 加入維度 assert，防止 QPSO 傳入錯誤 shape
   [FIX-3] data_dir 使用 os.makedirs(exist_ok=True) 確保目錄存在後才開 log
-  [FIX-4] smarts=None 時 disable_connectivity_position 傳 None 而非 []
-          （weight_generator.py 在 smarts=None 時不需要此參數）
+  [FIX-4] smarts=None 時 disable_connectivity_position 傳 [] 而非 None
   [FIX-5] --data_dir 預設值更名，避免與舊結果混淆
+  [FIX-6] log_gpu_info 新增 CUDA-Q 版本字串的 regex 解析保護，
+          避免 cudaq 0.7.1 回傳完整版本字串時印出異常
 ==============================================================================
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 
@@ -33,8 +35,7 @@ try:
     import cudaq
 except ImportError:
     print("[ERROR] 無法 import cudaq。請執行：")
-    print("  pip install cuda-quantum-cu11   # CUDA 11.x")
-    print("  pip install cuda-quantum-cu12   # CUDA 12.x")
+    print("  pip install cuda-quantum==0.7.1")
     sys.exit(1)
 
 # ── QMG 套件 ─────────────────────────────────────────────────────────────────
@@ -65,7 +66,7 @@ except ImportError as e:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="QMG CUDA-Q + SOQPSO 分子生成優化",
+        description="QMG CUDA-Q 0.7.1 + SOQPSO 分子生成優化",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # 電路參數
@@ -92,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--backend", type=str, default="cudaq_nvidia",
         choices=["cudaq_qpp", "cudaq_nvidia", "cudaq_nvidia_fp64", "tensornet"],
-        help="CUDA-Q 模擬後端（單 GPU 推薦 cudaq_nvidia）",
+        help="CUDA-Q 模擬後端（V100 單 GPU 推薦 cudaq_nvidia）",
     )
     # 輸出
     p.add_argument("--task_name", type=str,
@@ -143,10 +144,14 @@ def log_gpu_info(logger: logging.Logger) -> None:
     except Exception:
         logger.info("  GPU info: 無法取得（nvidia-smi 不可用）")
 
+    # [FIX-6] 0.7.1 的 __version__ 是完整字串，用 regex 提取純版號
     try:
-        logger.info(f"  CUDA-Q version: {cudaq.__version__}")
+        ver_str = cudaq.__version__
+        match = re.search(r'(\d+\.\d+\.\d+)', ver_str)
+        short_ver = match.group(1) if match else ver_str
+        logger.info(f"  CUDA-Q version: {short_ver} (full: {ver_str[:60]})")
     except AttributeError:
-        pass
+        logger.info("  CUDA-Q version: unknown")
 
     try:
         avail = [str(t) for t in cudaq.get_targets()]
@@ -181,11 +186,11 @@ def main() -> None:
     log_gpu_info(logger)
 
     # ── ConditionalWeightsGenerator（N=9, smarts=None → 全部 134 參數可自由優化）
-    # [FIX-4] smarts=None 時不傳 disable_connectivity_position
+    # [FIX-4] smarts=None 時傳 []（空 list），不傳 None
     cwg = ConditionalWeightsGenerator(
         args.num_heavy_atom,
         smarts=None,
-        disable_connectivity_position=[],   # [FIX-5] None 在 smarts≠None 時會 TypeError
+        disable_connectivity_position=[],
     )
     n_flexible = int((cwg.parameters_indicator == 0.0).sum())
     logger.info(f"Number of flexible parameters: {n_flexible}")
