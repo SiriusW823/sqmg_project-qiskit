@@ -1,6 +1,11 @@
 """
-cudaq_n9_diagnostic.py
-針對 _qmg_dynamic_n9 kernel 本身的深度診斷
+cudaq_n9_diagnostic.py  (v8.1)
+針對 QMG N=9 kernel 本身的深度診斷
+
+★ v8.1 修正：
+  原始版本引用已移除的 _qmg_dynamic_n9（v8 起已不再 export），
+  改為正確引用 make_qmg_n9_kernel，並更新對應呼叫方式。
+
 放到 ~/sqmg_project-cudaq/ 後執行：
   PYTHONPATH=~/sqmg_project-cudaq python cudaq_n9_diagnostic.py 2>&1 | tee n9_diag.txt
 """
@@ -9,31 +14,37 @@ import cudaq
 import numpy as np
 
 print("=" * 70)
-print("_qmg_dynamic_n9 Kernel 深度診斷")
+print("QMG N=9 Kernel 深度診斷 (v8.1)")
 print("=" * 70)
 
-# ── Test A：直接匯入並呼叫 _qmg_dynamic_n9 ───────────────────────────────
-print("\n[Test A] 直接 import 並 sample _qmg_dynamic_n9（不透過 Generator）")
+# ── Test A：直接匯入並呼叫 make_qmg_n9_kernel ────────────────────────────
+print("\n[Test A] 直接 import make_qmg_n9_kernel 並 sample（不透過 Generator）")
 try:
     cudaq.set_target("qpp-cpu")
-    from qmg.utils.build_dynamic_circuit_cudaq import _qmg_dynamic_n9
-    print(f"  kernel arguments = {_qmg_dynamic_n9.arguments}")
+    # ★ v8.1 修正：v8 起 _qmg_dynamic_n9 已移除，改用工廠函式 make_qmg_n9_kernel
+    from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
     w = [0.5] * 134
-    result = cudaq.sample(_qmg_dynamic_n9, w, shots_count=5)
+    kernel = make_qmg_n9_kernel(w)
+    result = cudaq.sample(kernel, shots_count=5)
     print(f"  ✓ 成功：{dict(list(result.items())[:3])}...")
+    del kernel
+    import gc; gc.collect()
 except Exception as e:
     print(f"  ✗ 失敗：{e}")
 
-# ── Test B：印出 MLIR module（看 kernel 的簽名是否正確） ─────────────────
-print("\n[Test B] 印出 _qmg_dynamic_n9 的 MLIR module（前 40 行）")
+# ── Test B：印出 kernel 的 MLIR module（看簽名是否正確）─────────────────
+print("\n[Test B] 印出 make_qmg_n9_kernel 產生的 MLIR module（前 40 行）")
 try:
-    from qmg.utils.build_dynamic_circuit_cudaq import _qmg_dynamic_n9
-    mlir_str = str(_qmg_dynamic_n9.module)
+    from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
+    import gc
+    kernel = make_qmg_n9_kernel([0.5] * 134)
+    mlir_str = str(kernel.module)
     lines = mlir_str.splitlines()
     for i, line in enumerate(lines[:40], 1):
         print(f"  {i:3d} | {line}")
     if len(lines) > 40:
         print(f"  ... ({len(lines)} lines total)")
+    del kernel; gc.collect()
 except Exception as e:
     print(f"  ✗ 失敗：{e}")
 
@@ -137,30 +148,41 @@ try:
 except Exception as e:
     print(f"  C3 ✗ {e}")
 
-# ── Test D：測試 _qmg_dynamic_n9 的 MLIR 是否能正常 compile ─────────────
-print("\n[Test D] 嘗試強制 compile _qmg_dynamic_n9")
+# ── Test D：測試 make_qmg_n9_kernel 的 MLIR 是否能正常 compile ──────────
+print("\n[Test D] 嘗試強制 compile make_qmg_n9_kernel([0.5]*134)")
 try:
-    from qmg.utils.build_dynamic_circuit_cudaq import _qmg_dynamic_n9
-    _qmg_dynamic_n9.compile()
+    import gc
+    from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
+    kernel = make_qmg_n9_kernel([0.5] * 134)
+    kernel.compile()
     print("  compile() 成功")
+    del kernel; gc.collect()
 except Exception as e:
     print(f"  compile() 失敗：{e}")
 
-# ── Test E：直接呼叫 kernel 物件（不透過 cudaq.sample） ─────────────────
-print("\n[Test E] 直接呼叫 _qmg_dynamic_n9([0.5]*134)（single execution）")
-try:
-    from qmg.utils.build_dynamic_circuit_cudaq import _qmg_dynamic_n9
-    cudaq.set_target("qpp-cpu")
-    # 設定 execution context（模仿 sample.py 的做法）
-    import cudaq.runtime as cudaq_runtime
-    cudaq_runtime.setExecutionContext("sample", 1)
-    _qmg_dynamic_n9([0.5] * 134)
-    cudaq_runtime.resetExecutionContext()
-    print("  ✓ 直接呼叫成功")
-except AttributeError:
-    print("  cudaq_runtime.setExecutionContext 不存在，略過")
-except Exception as e:
-    print(f"  ✗ 失敗：{e}")
+# ── Test E：完整 N=9 kernel 採樣驗證（GPU + CPU）─────────────────────────
+print("\n[Test E] 完整 N=9 kernel 採樣驗證（10 shots）")
+import gc, time
+from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
+
+for target in ["qpp-cpu", "nvidia"]:
+    print(f"\n  [Target: {target}]")
+    try:
+        cudaq.set_target(target)
+        kernel = make_qmg_n9_kernel([0.5] * 134)
+        t0 = time.time()
+        r = cudaq.sample(kernel, shots_count=10)
+        elapsed = time.time() - t0
+        items = dict(list(r.items())[:3])
+        print(f"  ✓ 成功：{items}  ({elapsed:.2f}s)")
+        # 驗證 bitstring 長度
+        sample_bs = list(r.items())
+        if sample_bs:
+            bs_len = len(sample_bs[0][0])
+            print(f"  bitstring 長度: {bs_len} (預期 ≤ 90)")
+        del kernel; gc.collect()
+    except Exception as e:
+        print(f"  ✗ 失敗：{e}")
 
 # ── Test F：查 sample.py 完整內容 ────────────────────────────────────────
 print("\n[Test F] sample.py 完整內容")
@@ -170,12 +192,12 @@ sample_py = os.path.join(os.path.dirname(spec.origin), "runtime", "sample.py")
 if os.path.exists(sample_py):
     with open(sample_py) as f:
         lines = f.readlines()
-    print(f"  共 {len(lines)} 行，完整內容：")
-    for i, line in enumerate(lines, 1):
+    print(f"  共 {len(lines)} 行，前 40 行：")
+    for i, line in enumerate(lines[:40], 1):
         print(f"  {i:4d} | {line}", end='')
 else:
     print(f"  {sample_py} 不存在")
 
 print("\n" + "=" * 70)
-print("診斷完成")
+print("診斷完成 (v8.1)")
 print("=" * 70)

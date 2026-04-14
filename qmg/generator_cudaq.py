@@ -1,20 +1,25 @@
 """
 ==============================================================================
-generator_cudaq.py  (CUDA-Q 0.7.1 / V100 sm_70 完整修正版 v8)
+generator_cudaq.py  (CUDA-Q 0.7.1 / V100 sm_70 完整修正版 v8.1)
 ==============================================================================
 
-v7 問題：
-  每次建立新 @cudaq.kernel → MLIR module 累積 → 155 次後 OOM → Killed
-  qpp-cpu shot-by-shot loop：~95s/eval × 520 evals = ~14h，太慢
+v8.1 修正（相對於 v8）：
+  ★ BUG FIX：_reconstruct_bitstrings_n9() 中
+      bond9_bits = global_data[i][4:20]   ← 錯誤：跳過前4位，導致atom-9所有
+                                            bond type 資訊系統性錯位
+      →
+      bond9_bits = global_data[i][0:16]   ← 正確：16個無名mz()從index 0開始
 
-v8 修正：
-  1. ★ 記憶體管理：sample_molecule() 完成後 del kernel + gc.collect()
-  2. ★ 效能：GPU (nvidia) supportsConditionalFeedback=True
-               → cuStateVec 一次完成所有 shots，預計 1~5s/eval
-               → 強烈建議使用 --backend cudaq_nvidia
+    影響：修正前 atom-9 的 bond type 資訊全部偏移，造成 uniqueness 長期壓在
+    0.05~0.35，validity 亦受影響。修正後應接近論文基線 V×U ≈ 0.8834。
+
+v8 設計：
+  1. 記憶體管理：sample_molecule() 完成後 del kernel + gc.collect()
+  2. 效能：GPU (nvidia) supportsConditionalFeedback=True
+             → cuStateVec 一次完成所有 shots，預計 1~5s/eval
 
 速度對比（10000 shots，N=9）：
-  qpp-cpu  : ~90s/eval，基於 Python shot-by-shot loop（10000 次呼叫）
+  qpp-cpu  : ~90s/eval，Python shot-by-shot loop
   nvidia   : ~1-5s/eval，cuStateVec 原生處理（GPU 記憶體內完成）
 ==============================================================================
 """
@@ -146,7 +151,13 @@ def _reconstruct_bitstrings_n9(result) -> dict[str, int]:
     """
     90-bit bitstring 重建：
       bits[ 0:74] — 74 個具名 mz() → get_sequential_data(reg)
-      bits[74:90] — 16 個無名 mz()（鍵 9-{1..8}）→ __global__[4:20]
+      bits[74:90] — 16 個無名 mz()（鍵 9-{1..8}）→ __global__[0:16]
+
+    ★ v8.1 修正：
+      __global__ 暫存器中 atom-9 的 bond bits 從 index 0 開始，
+      原本的 [4:20] 是錯誤的（跳過了 b91_0, b91_1, b92_0, b92_1 四個位元），
+      導致整個 atom-9 bond type 資訊系統性錯位，uniqueness 長期偏低。
+      正確索引：global_data[i][0:16]
     """
     try:
         reg_data = {reg: result.get_sequential_data(reg) for reg in _N9_NAMED_REGS}
@@ -173,8 +184,10 @@ def _reconstruct_bitstrings_n9(result) -> dict[str, int]:
     for i in range(n_shots):
         named_bits = ''.join(reg_data[reg][i] for reg in _N9_NAMED_REGS)
 
-        if global_data and len(global_data) > i and len(global_data[i]) >= 20:
-            bond9_bits = global_data[i][4:20]
+        # ★ v8.1 BUG FIX：改為 [0:16]，atom-9 的 16 個 bond bits 從 index 0 開始
+        # 原始錯誤：global_data[i][4:20] 會跳過前 4 位，導致 b91、b92 位元錯位
+        if global_data and len(global_data) > i and len(global_data[i]) >= 16:
+            bond9_bits = global_data[i][0:16]
         else:
             bond9_bits = '0' * 16
             if not warned_global:
@@ -256,7 +269,8 @@ class MoleculeGeneratorCUDAQ:
             f"  N atoms       : {num_heavy_atom}\n"
             f"  weight dim    : {self.circuit_builder.length_all_weight_vector}\n"
             f"  expected_bits : {self.expected_bits}\n"
-            f"  design        : closure/capture + gc.collect() memory management"
+            f"  design        : closure/capture + gc.collect() memory management\n"
+            f"  bond9 fix     : global_data[i][0:16] (v8.1 bugfix)"
         )
 
     def update_weight_vector(
@@ -333,7 +347,7 @@ MoleculeGenerator = MoleculeGeneratorCUDAQ
 if __name__ == "__main__":
     import time
 
-    print("=== MoleculeGeneratorCUDAQ 功能驗證 (v8) ===")
+    print("=== MoleculeGeneratorCUDAQ 功能驗證 (v8.1) ===")
     ver_str, is_compat = _check_cudaq_version_volta_compat()
     print(f"CUDA-Q : {ver_str}  Volta compat: {'✓' if is_compat else '⚠ >=0.8'}")
 
