@@ -1,28 +1,21 @@
 """
 ==============================================================================
-build_dynamic_circuit_cudaq.py  (v9 — 根本修正版)
+build_dynamic_circuit_cudaq.py  (v9.1 — 分號修正版)
 ==============================================================================
 
-v8 → v9 修正：
-  ★ BUG ROOT CAUSE (CUDA-Q 0.7.1 known bug):
-      CUDA-Q 0.7.1 對含 mid-circuit measurement 的 kernel，
-      get_sequential_data('__global__') 運作異常（0.8.0 才修）。
-      v8 依賴 __global__ 取 bond-9 的 16 bits → 全部落入
-      `except Exception: global_data = None` → bond9_bits = '0'*16
-      → uniqueness 長期壓在 0.05~0.35
+v9 → v9.1 修正：
 
-  ★ OOM FIX (Killed at eval ~155):
-      v8 的 closure 工廠函式 make_qmg_n9_kernel() 每次呼叫
-      都新建一個 MLIR module，del + gc.collect() 只能釋放 Python 層，
-      C++ MLIR registry 持續累積 → 約 155 次後 OOM Killed。
+  ★ BUG-FIX (CUDA-Q AST 分號解析問題)：
+      CUDA-Q 的 Python AST transformer 在提取命名暫存器（classical register name）
+      時，對於形如 `a = mz(q[4]); b = mz(q[5])` 的同行雙賦值語句，
+      部分 CUDA-Q 版本的 MLIR 前端（mlir-translate pass）僅識別第一個賦值
+      的變數名稱，第二個賦值可能被標記為 anonymous register 或沿用前一個名稱，
+      導致 get_sequential_data('b91_1') 等呼叫找不到正確暫存器而失敗。
+      修正：將末尾 Phase 8 的 16 個 mz() 賦值全部拆為獨立行。
 
-  ★ v9 兩大修正：
-    (1) 將最後 16 個 bond-9 mz() 全部命名（b91_0...b98_1），
-        徹底消除對 __global__ 的依賴。
-    (2) 改用 module-level parametric kernel _qmg_n9(w: list[float])，
-        @cudaq.kernel 裝飾器在模組載入時只編譯一次 MLIR，
-        每次呼叫 cudaq.sample(_qmg_n9, w_list, ...) 重用同一 MLIR，
-        完全解決記憶體累積問題。
+  ★ 新增 make_qmg_n9_kernel 相容 wrapper：
+      cudaq_n9_diagnostic.py 等工具腳本引用此函式，
+      v9 移除後造成 ImportError。加回一個 wrapper 回傳 _qmg_n9 參數化 kernel。
 
 bitstring 結構（90 bits，對應 _N9_ALL_REGS 的順序）：
   bits[ 0: 2]  a1_0,  a1_1         (atom-1 type)
@@ -32,15 +25,13 @@ bitstring 結構（90 bits，對應 _N9_ALL_REGS 的順序）：
   bits[ 8:12]  b31_0, b31_1, b32_0, b32_1
   ...
   bits[72:74]  a9_0,  a9_1
-  bits[74:76]  b91_0, b91_1
-  ...
-  bits[88:90]  b98_0, b98_1        (bond 9→8)
+  bits[74:90]  b91_0..b98_1        (bond 9→1..9→8)
 ==============================================================================
 """
 from __future__ import annotations
 
 import math
-import gc
+import warnings
 import numpy as np
 from typing import Union, List
 
@@ -51,17 +42,17 @@ import cudaq
 # Module-level Parametric Kernel  (MLIR 只編譯一次)
 # ===========================================================================
 #
-# 重要設計原則：
+# 設計原則：
 #   - 定義在模組層級，@cudaq.kernel 裝飾器在 import 時一次性編譯 MLIR
 #   - 每次 cudaq.sample(_qmg_n9, w_list, ...) 只傳遞不同的 w_list，
-#     不新建 MLIR module → 無記憶體累積，徹底解決 OOM
-#   - 所有 90 個 mz() 均有命名變數 → 不依賴 __global__ (CUDA-Q 0.7.1 bug)
+#     不新建 MLIR module → 無記憶體累積，解決 OOM
+#   - 所有 90 個 mz() 均有獨立命名（每條賦值各占一行）→ 不依賴 __global__
 #
 @cudaq.kernel
 def _qmg_n9(w: list[float]):
     """
     N=9 QMG 動態電路（parametric，w 長度 134）。
-    所有 90 個 mz() 均有命名 → 對應 _N9_ALL_REGS 中的 90 個暫存器。
+    所有 90 個 mz() 均有命名且各占獨立行 → 對應 _N9_ALL_REGS 中的 90 個暫存器。
     """
     q = cudaq.qvector(20)
 
@@ -483,30 +474,66 @@ def _qmg_n9(w: list[float]):
         ry.ctrl(math.pi * w[132], q[19], q[18])
         ry.ctrl(math.pi * w[133], q[18], q[19])
 
-    # ★ v9 修正：全部命名，徹底消除對 __global__ 的依賴
+    # ★ v9.1 修正：每個 mz() 各占獨立行，確保 CUDA-Q AST 正確識別命名暫存器
     # 對應 _N9_ALL_REGS[74:90]
-    b91_0 = mz(q[4]);  b91_1 = mz(q[5])
-    b92_0 = mz(q[6]);  b92_1 = mz(q[7])
-    b93_0 = mz(q[8]);  b93_1 = mz(q[9])
-    b94_0 = mz(q[10]); b94_1 = mz(q[11])
-    b95_0 = mz(q[12]); b95_1 = mz(q[13])
-    b96_0 = mz(q[14]); b96_1 = mz(q[15])
-    b97_0 = mz(q[16]); b97_1 = mz(q[17])
-    b98_0 = mz(q[18]); b98_1 = mz(q[19])
+    b91_0 = mz(q[4])
+    b91_1 = mz(q[5])
+    b92_0 = mz(q[6])
+    b92_1 = mz(q[7])
+    b93_0 = mz(q[8])
+    b93_1 = mz(q[9])
+    b94_0 = mz(q[10])
+    b94_1 = mz(q[11])
+    b95_0 = mz(q[12])
+    b95_1 = mz(q[13])
+    b96_0 = mz(q[14])
+    b96_1 = mz(q[15])
+    b97_0 = mz(q[16])
+    b97_1 = mz(q[17])
+    b98_0 = mz(q[18])
+    b98_1 = mz(q[19])
 
 
 # ===========================================================================
-# DynamicCircuitBuilderCUDAQ  (v9)
+# 向後相容 wrapper（供 cudaq_n9_diagnostic.py 等工具腳本使用）
+# ===========================================================================
+
+def make_qmg_n9_kernel(weights=None):
+    """
+    相容 wrapper：回傳 module-level parametric kernel _qmg_n9。
+
+    v9 起已改用 parametric kernel 模式，不再需要每次建立新 closure kernel。
+    此函式保留是為了讓舊版診斷腳本（cudaq_n9_diagnostic.py）不需修改即可 import。
+
+    Args:
+        weights: 忽略（v9 使用 parametric kernel，weights 在 sample 時傳入）
+
+    Returns:
+        _qmg_n9 module-level kernel
+    """
+    if weights is not None:
+        warnings.warn(
+            "make_qmg_n9_kernel(weights) 中的 weights 參數已被忽略。\n"
+            "v9 使用 parametric kernel：請改用 cudaq.sample(_qmg_n9, w_list, ...)。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return _qmg_n9
+
+
+# ===========================================================================
+# DynamicCircuitBuilderCUDAQ  (v9.1)
 # ===========================================================================
 
 class DynamicCircuitBuilderCUDAQ:
     """
-    CUDA-Q 0.7.1 版 QMG 動態電路建構器（v9 parametric kernel 版）。
+    CUDA-Q 0.7.1 版 QMG 動態電路建構器（v9.1 分號修正版）。
 
-    v9 設計改變：
+    設計說明：
       - 使用 module-level parametric kernel _qmg_n9(w: list[float])
       - MLIR 只在模組載入時編譯一次，每次評估重用
-      - 解決 OOM 問題（v8 closure 方式的根本問題）
+      - 所有 90 個 mz() 各占獨立行 → 確保 AST 正確識別命名暫存器
+      - 無記憶體累積 OOM 問題
     """
 
     def __init__(
@@ -542,26 +569,28 @@ class DynamicCircuitBuilderCUDAQ:
         )
         return [float(x) for x in w_list]
 
-    # 保留舊介面以向後相容（但已不再需要新建 closure kernel）
     def build_kernel_from_weights(self, weights):
         """
         [已廢棄，保留向後相容] v9 不再需要每次建立新 kernel。
-        請改用 get_kernel() + prepare_weights() 或直接使用 _qmg_n9。
+        請改用 get_kernel() + prepare_weights()。
         """
-        import warnings
         warnings.warn(
             "build_kernel_from_weights() 已廢棄。"
             "請改用 get_kernel() + prepare_weights()。"
-            "v9 使用 parametric kernel，不再需要此方法。",
+            "v9.1 使用 parametric kernel，不再需要此方法。",
             DeprecationWarning,
             stacklevel=2,
         )
-        return _qmg_n9  # 回傳同一個 parametric kernel（忽略 weights）
+        return _qmg_n9
 
     def apply_bond_disconnection_correction(self, bitstring: str) -> str:
         """
         修正孤立重原子（存在但無鍵連接）的 bitstring。
         bitstring 順序與 _N9_ALL_REGS 一致（90 bits）。
+
+        對於 atom k（k=3..9），若 atom 存在但所有出鍵均為 0，
+        強制設最後一個鍵 bit 為 1（對應 bond_end-1），
+        即 '01' = SINGLE bond，確保分子連通性。
         """
         if not self.remove_bond_disconnection:
             return bitstring

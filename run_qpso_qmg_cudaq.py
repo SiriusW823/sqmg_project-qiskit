@@ -1,15 +1,19 @@
 """
 ==============================================================================
-run_qpso_qmg_cudaq.py  ─ CUDA-Q 0.7.1 + SOQPSO 主入口（完整修正版）
+run_qpso_qmg_cudaq.py  ─ CUDA-Q 0.7.1 + SOQPSO 主入口（v9.1 修正版）
 ==============================================================================
-修正清單：
-  [FIX-1] import 路徑改為 qmg.utils（配合 qmg/utils/ 套件目錄）
-  [FIX-2] evaluate_fn 加入維度 assert，防止 QPSO 傳入錯誤 shape
-  [FIX-3] data_dir 使用 os.makedirs(exist_ok=True) 確保目錄存在後才開 log
-  [FIX-4] smarts=None 時 disable_connectivity_position 傳 [] 而非 None
-  [FIX-5] --data_dir 預設值更名，避免與舊結果混淆
-  [FIX-6] log_gpu_info 新增 CUDA-Q 版本字串的 regex 解析保護，
-          避免 cudaq 0.7.1 回傳完整版本字串時印出異常
+v9 → v9.1 修正清單：
+  [FIX-1] 移除 --backend choices 中的 tensornet（對動態電路不相容）
+  [FIX-2] evaluate_fn 加入 validity=0 的警告日誌，方便追蹤採樣失敗
+  [FIX-3] 其餘邏輯不變，維持與 v9 完全一致
+
+原 v9 修正清單（保留）：
+  [FIX-A] import 路徑改為 qmg.utils
+  [FIX-B] evaluate_fn 維度 assert
+  [FIX-C] data_dir makedirs
+  [FIX-D] smarts=None 傳 []
+  [FIX-E] --data_dir 預設值更名
+  [FIX-F] log_gpu_info regex 保護
 ==============================================================================
 """
 from __future__ import annotations
@@ -35,7 +39,8 @@ try:
     import cudaq
 except ImportError:
     print("[ERROR] 無法 import cudaq。請執行：")
-    print("  pip install cuda-quantum==0.7.1")
+    print("  pip install cuda-quantum-cu11==0.7.1  # CUDA 11.x")
+    print("  pip install cuda-quantum-cu12==0.7.1  # CUDA 12.x")
     sys.exit(1)
 
 # ── QMG 套件 ─────────────────────────────────────────────────────────────────
@@ -90,10 +95,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",             type=int,   default=42,
                    help="隨機種子")
     # Backend
+    # ★ FIX-1：移除 tensornet（對含 mid-circuit measurement 的動態電路不相容）
     p.add_argument(
         "--backend", type=str, default="cudaq_nvidia",
-        choices=["cudaq_qpp", "cudaq_nvidia", "cudaq_nvidia_fp64", "tensornet"],
-        help="CUDA-Q 模擬後端（V100 單 GPU 推薦 cudaq_nvidia）",
+        choices=["cudaq_qpp", "cudaq_nvidia", "cudaq_nvidia_fp64"],
+        help=(
+            "CUDA-Q 模擬後端。\n"
+            "  cudaq_nvidia     : V100 GPU（推薦）\n"
+            "  cudaq_nvidia_fp64: V100 GPU（雙精度，較慢）\n"
+            "  cudaq_qpp        : CPU（僅供除錯，~90s/eval）\n"
+            "  注意：tensornet 對動態電路不相容，已移除。"
+        ),
     )
     # 輸出
     p.add_argument("--task_name", type=str,
@@ -144,7 +156,6 @@ def log_gpu_info(logger: logging.Logger) -> None:
     except Exception:
         logger.info("  GPU info: 無法取得（nvidia-smi 不可用）")
 
-    # [FIX-6] 0.7.1 的 __version__ 是完整字串，用 regex 提取純版號
     try:
         ver_str = cudaq.__version__
         match = re.search(r'(\d+\.\d+\.\d+)', ver_str)
@@ -167,13 +178,12 @@ def log_gpu_info(logger: logging.Logger) -> None:
 def main() -> None:
     args = parse_args()
 
-    # [FIX-3] 先建立目錄，才能開 log file
     os.makedirs(args.data_dir, exist_ok=True)
 
     log_path = os.path.join(args.data_dir, f"{args.task_name}.log")
     logger   = setup_logger(log_path)
 
-    # ── 啟動資訊（格式對齊 unconditional_9.log）──────────────────────────────
+    # ── 啟動資訊（格式對齊 unconditional_9.log）
     logger.info(f"Task name: {args.task_name}")
     logger.info(f"Task: ['validity', 'uniqueness']")
     logger.info(f"Condition: ['None', 'None']")
@@ -186,7 +196,6 @@ def main() -> None:
     log_gpu_info(logger)
 
     # ── ConditionalWeightsGenerator（N=9, smarts=None → 全部 134 參數可自由優化）
-    # [FIX-4] smarts=None 時傳 []（空 list），不傳 None
     cwg = ConditionalWeightsGenerator(
         args.num_heavy_atom,
         smarts=None,
@@ -195,7 +204,6 @@ def main() -> None:
     n_flexible = int((cwg.parameters_indicator == 0.0).sum())
     logger.info(f"Number of flexible parameters: {n_flexible}")
 
-    # 健全性檢查：smarts=None 時 n_flexible 應等於 length_all_weight_vector(134)
     assert n_flexible == cwg.length_all_weight_vector, (
         f"[BUG] n_flexible={n_flexible} != "
         f"length_all_weight_vector={cwg.length_all_weight_vector}"
@@ -209,7 +217,7 @@ def main() -> None:
         f"backend={args.backend}"
     )
 
-    # ── CUDA-Q 生成器（一次性建立，避免重複 JIT 編譯）────────────────────────
+    # ── CUDA-Q 生成器（一次性建立，避免重複 JIT 編譯）
     logger.info(
         "[CUDAQ] 初始化 MoleculeGeneratorCUDAQ"
         "（首次 JIT 編譯可能需 10~60s，請耐心等待）..."
@@ -223,14 +231,13 @@ def main() -> None:
     )
     logger.info(f"[CUDAQ] 初始化完成，耗時 {time.time() - t_init:.1f}s")
 
-    # ── Evaluate function（QPSO → 量子電路評估）───────────────────────────────
+    # ── Evaluate function（QPSO → 量子電路評估）
     def evaluate_fn(pos: np.ndarray) -> tuple:
         """
         pos : shape=(n_flexible=134,)，值域 [0,1]
-        apply_chemistry_constraint 套用 bond_type softmax 後
-        作為完整 134-dim weight vector 送入電路。
+        apply_chemistry_constraint 套用後作為完整 134-dim weight vector 送入電路。
         """
-        # [FIX-2] 維度防呆
+        # 維度防呆
         if len(pos) != n_flexible:
             raise ValueError(
                 f"[evaluate_fn] pos 維度錯誤：got {len(pos)}, expected {n_flexible}"
@@ -238,9 +245,19 @@ def main() -> None:
         w = cwg.apply_chemistry_constraint(pos.copy())
         generator.update_weight_vector(w)
         _, validity, uniqueness = generator.sample_molecule(args.num_sample)
+
+        # ★ FIX-2：validity=0 時記錄警告，協助判斷是採樣失敗還是參數問題
+        if validity == 0.0:
+            logger.warning(
+                "[evaluate_fn] validity=0.0 — 可能原因：\n"
+                "  1. 命名暫存器未正確識別（確認 v9.1 build_dynamic_circuit_cudaq.py 已部署）\n"
+                "  2. 所有 shots 均產生無效分子（正常情況，優化早期可能發生）\n"
+                "  3. raw_counts 為空（檢查 generator 初始化日誌中的 register 警告）"
+            )
+
         return float(validity), float(uniqueness)
 
-    # ── SOQPSO 優化（與 Qiskit 版完全共用，僅 evaluate_fn 不同）─────────────
+    # ── SOQPSO 優化
     optimizer = QMGSOQPSOOptimizer(
         n_params          = n_flexible,
         n_particles       = args.particles,
@@ -258,7 +275,7 @@ def main() -> None:
 
     best_params, best_fitness = optimizer.optimize()
 
-    # ── 儲存最佳參數 ─────────────────────────────────────────────────────────
+    # ── 儲存最佳參數
     best_npy = os.path.join(args.data_dir, f"{args.task_name}_best_params.npy")
     np.save(best_npy, best_params)
     logger.info(f"最佳參數已儲存: {best_npy}")
