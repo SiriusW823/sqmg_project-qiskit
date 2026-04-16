@@ -1,203 +1,170 @@
 """
-cudaq_n9_diagnostic.py  (v8.1)
-針對 QMG N=9 kernel 本身的深度診斷
+cudaq_n9_diagnostic.py  (v9.2)
+QMG N=9 深度診斷
 
-★ v8.1 修正：
-  原始版本引用已移除的 _qmg_dynamic_n9（v8 起已不再 export），
-  改為正確引用 make_qmg_n9_kernel，並更新對應呼叫方式。
+★ v9.2 關鍵說明：
+  CUDA-Q 0.7.1 的 broadcast dispatch bug：
+    - 跨模組 import 的 list[float] kernel → broadcast 觸發 → RuntimeError
+    - 同檔案定義的 list[float] kernel → 正常呼叫
+  v9.2 的解法：MoleculeGeneratorCUDAQ 在 generator_cudaq.py 中
+               使用本檔定義的 _qmg_n9_v9，不 import 跨模組 kernel。
+  
+  診斷腳本驗證方式：
+    - 直接 sample 測試：透過 MoleculeGeneratorCUDAQ.sample_molecule()（間接呼叫本檔 kernel）
+    - 不直接呼叫 cudaq.sample(imported_kernel, w, ...)（會觸發 broadcast bug）
 
-放到 ~/sqmg_project-cudaq/ 後執行：
-  PYTHONPATH=~/sqmg_project-cudaq python cudaq_n9_diagnostic.py 2>&1 | tee n9_diag.txt
+執行方式：
+  PYTHONPATH=~/sqmg_project-cudaq python cudaq_n9_diagnostic.py 2>&1 | tee n9_diag_v92.txt
 """
 import math
+import time
+import gc
+import re
 import cudaq
 import numpy as np
 
 print("=" * 70)
-print("QMG N=9 Kernel 深度診斷 (v8.1)")
+print("QMG N=9 Kernel 深度診斷 (v9.2)")
 print("=" * 70)
 
-# ── Test A：直接匯入並呼叫 make_qmg_n9_kernel ────────────────────────────
-print("\n[Test A] 直接 import make_qmg_n9_kernel 並 sample（不透過 Generator）")
+# ── Pre-check ─────────────────────────────────────────────────────────────────
+print("\n[Pre-check] 版本與 GPU 確認")
+import sys
+try:
+    ver = cudaq.__version__
+    m = re.search(r'(\d+\.\d+\.\d+)', ver)
+    print(f"  CUDA-Q version : {m.group(1) if m else ver}")
+    # ★ 修正：正確解析 target name（target string 含 newline）
+    targets_raw = [str(t) for t in cudaq.get_targets()]
+    target_names = [t.split('\n')[0].replace('Target','').strip() for t in targets_raw]
+    print(f"  Target names   : {target_names}")
+    gpu_ok = 'nvidia' in target_names
+    print(f"  GPU (nvidia)   : {'✓ 可用' if gpu_ok else '✗ 不可用'}")
+    try:
+        n = cudaq.num_available_gpus()
+        print(f"  GPU count      : {n}")
+    except Exception:
+        pass
+except Exception as e:
+    print(f"  ✗ {e}"); sys.exit(1)
+
+try:
+    from qmg.generator_cudaq import MoleculeGeneratorCUDAQ, _N9_ALL_REGS, _qmg_n9_v9
+    from qmg.utils.weight_generator import ConditionalWeightsGenerator
+    assert len(_N9_ALL_REGS) == 90
+    print(f"  _N9_ALL_REGS   : {len(_N9_ALL_REGS)} 個暫存器 ✓")
+except Exception as e:
+    print(f"  ✗ import 失敗：{e}"); sys.exit(1)
+
+# ── Test A：局部小型 kernel（確認 list[float] + mid-circuit 基本功能）──────────
+print("\n[Test A] 局部 list[float] + mid-circuit kernel（確認 CUDA-Q 0.7.1 基本功能）")
+
+@cudaq.kernel
+def _local_test_kernel(params: list[float]):
+    q = cudaq.qvector(6)
+    ry(math.pi * params[0], q[0])
+    ry(math.pi * params[1], q[1])
+    x.ctrl(q[0], q[1])
+    ry.ctrl(math.pi * params[2], q[1], q[2])
+    a0 = mz(q[0]); a1 = mz(q[1]); a2 = mz(q[2])
+    if a0 or a1:
+        ry(math.pi * params[3], q[3]); x(q[4])
+        x.ctrl(q[3], q[4])
+        ry.ctrl(math.pi * params[4], q[3], q[4])
+    b0 = mz(q[3]); b1 = mz(q[4]); b2 = mz(q[5])
+
+cudaq.set_target("qpp-cpu")
+try:
+    r = cudaq.sample(_local_test_kernel, [0.5, 0.3, 0.2, 0.8, 0.4], shots_count=20)
+    print(f"  ✓ 成功：{dict(list(r.items())[:3])}")
+    # 命名暫存器驗證
+    for reg in ['a0', 'b0']:
+        d = r.get_sequential_data(reg)
+        print(f"  register '{reg}': len={len(d)}, shots={d[:5]}")
+    print("  ✓ mid-circuit + 命名暫存器 均正常")
+except Exception as e:
+    print(f"  ✗ 失敗：{e}")
+
+# ── Test B：說明 broadcast bug ───────────────────────────────────────────────
+print("\n[Test B] CUDA-Q 0.7.1 broadcast bug 說明（預期失敗，僅記錄）")
+print("  注意：cudaq.sample(imported_kernel, list, ...) 在 CUDA-Q 0.7.1 中，")
+print("        若 kernel 從其他模組 import，list 會被誤解為 broadcast set → TypeError")
+print("  v9.2 解法：kernel 直接定義在 generator_cudaq.py 中，MoleculeGeneratorCUDAQ")
+print("              內部呼叫同檔 kernel → broadcast 不觸發")
+try:
+    # 故意測試：從別的模組 import 的 _qmg_n9_v9 呼叫
+    w = [0.5] * 134
+    r = cudaq.sample(_qmg_n9_v9, w, shots_count=5)
+    print(f"  結果：成功（{dict(list(r.items())[:2])}）— 此版本 broadcast bug 已修正或行為不同")
+except Exception as e:
+    print(f"  結果：失敗（預期）— {str(e)[:80]}")
+    print("  → 確認：v9.2 正確透過 MoleculeGeneratorCUDAQ 內部呼叫規避此問題")
+
+# ── Test C：MoleculeGeneratorCUDAQ 端到端（qpp-cpu，200 shots）──────────────
+print("\n[Test C] MoleculeGeneratorCUDAQ 端到端（qpp-cpu，200 shots）")
+try:
+    cwg = ConditionalWeightsGenerator(9, smarts=None)
+    w   = cwg.generate_conditional_random_weights(random_seed=42)
+    assert len(w) == 134, f"weight 長度錯誤：{len(w)}"
+    print(f"  weight_generator OK: len={len(w)}, range=[{w.min():.3f}, {w.max():.3f}]")
+
+    gen = MoleculeGeneratorCUDAQ(9, all_weight_vector=w, backend_name="cudaq_qpp")
+    t0  = time.time()
+    sd, v, u = gen.sample_molecule(200)
+    elapsed  = time.time() - t0
+    valid    = [k for k in sd if k and k != "None"]
+
+    print(f"  V={v:.3f}  U={u:.3f}  V×U={v*u:.4f}  ({elapsed:.1f}s)")
+    print(f"  有效分子種數：{len(valid)}")
+    if valid:
+        print(f"  範例 SMILES：{valid[:5]}")
+
+    if v > 0.3 and u > 0.3:
+        print("  ✓ v9.2 CPU 正常，V>0.3 且 U>0.3 ✓")
+    elif v > 0:
+        print("  ⚠ 有結果但 V 或 U 偏低（參數 seed=42 初始值，optimizer 會調整）")
+    else:
+        print("  ✗ validity=0，請回報 CUDA-Q 版本及暫存器診斷結果")
+except Exception as e:
+    print(f"  ✗ 失敗：{e}")
+    import traceback; traceback.print_exc()
+
+# ── Test D：GPU 測試（nvidia，100 shots）──────────────────────────────────
+print("\n[Test D] MoleculeGeneratorCUDAQ GPU 測試（nvidia，100 shots）")
+try:
+    gen_gpu = MoleculeGeneratorCUDAQ(9, all_weight_vector=w, backend_name="cudaq_nvidia")
+    t0      = time.time()
+    sd_gpu, v_gpu, u_gpu = gen_gpu.sample_molecule(100)
+    elapsed = time.time() - t0
+    valid_gpu = [k for k in sd_gpu if k and k != "None"]
+
+    print(f"  V={v_gpu:.3f}  U={u_gpu:.3f}  V×U={v_gpu*u_gpu:.4f}  ({elapsed:.1f}s)")
+    print(f"  有效分子種數：{len(valid_gpu)}")
+    if elapsed < 30:
+        print(f"  ✓ GPU 加速正常（{elapsed:.1f}s < 30s）")
+    else:
+        print(f"  ⚠ 速度偏慢（{elapsed:.1f}s），可能仍在 CPU 執行")
+    if v_gpu > 0:
+        print(f"  ✓ GPU 有效結果 ✓")
+    else:
+        print(f"  ✗ GPU validity=0")
+except Exception as e:
+    print(f"  ✗ GPU 失敗：{e}")
+
+# ── Test E：10000 shots CPU 速度預估 ─────────────────────────────────────
+print("\n[Test E] 10000 shots 速度預估（qpp-cpu，50 shots 計時）")
 try:
     cudaq.set_target("qpp-cpu")
-    # ★ v8.1 修正：v8 起 _qmg_dynamic_n9 已移除，改用工廠函式 make_qmg_n9_kernel
-    from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
-    w = [0.5] * 134
-    kernel = make_qmg_n9_kernel(w)
-    result = cudaq.sample(kernel, shots_count=5)
-    print(f"  ✓ 成功：{dict(list(result.items())[:3])}...")
-    del kernel
-    import gc; gc.collect()
+    gen_spd = MoleculeGeneratorCUDAQ(9, all_weight_vector=w, backend_name="cudaq_qpp")
+    t0 = time.time()
+    gen_spd.sample_molecule(50)
+    rate = (time.time() - t0) / 50  # s/shot
+    est_10k = rate * 10000
+    print(f"  CPU: {rate*1000:.1f} ms/shot → 10000 shots ≈ {est_10k:.0f}s ({est_10k/60:.1f} min)")
+    print(f"  完整實驗 520 evals: ≈ {est_10k*520/3600:.0f}h → 強烈建議用 GPU")
 except Exception as e:
-    print(f"  ✗ 失敗：{e}")
-
-# ── Test B：印出 kernel 的 MLIR module（看簽名是否正確）─────────────────
-print("\n[Test B] 印出 make_qmg_n9_kernel 產生的 MLIR module（前 40 行）")
-try:
-    from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
-    import gc
-    kernel = make_qmg_n9_kernel([0.5] * 134)
-    mlir_str = str(kernel.module)
-    lines = mlir_str.splitlines()
-    for i, line in enumerate(lines[:40], 1):
-        print(f"  {i:3d} | {line}")
-    if len(lines) > 40:
-        print(f"  ... ({len(lines)} lines total)")
-    del kernel; gc.collect()
-except Exception as e:
-    print(f"  ✗ 失敗：{e}")
-
-# ── Test C：找出第一個讓 sample 失敗的操作 ────────────────────────────────
-print("\n[Test C] 找出問題節點 — 逐步增加複雜度")
-
-# C1: 只有 ry + mz（no conditional）
-@cudaq.kernel
-def k_c1(weights: list[float]):
-    q = cudaq.qvector(20)
-    ry(math.pi * weights[0], q[0])
-    x(q[1])
-    ry(math.pi * weights[2], q[2])
-    a1_0 = mz(q[0])
-    a1_1 = mz(q[1])
-    a2_0 = mz(q[2])
-    a2_1 = mz(q[3])
-
-try:
-    r = cudaq.sample(k_c1, [0.5]*134, shots_count=5)
-    print(f"  C1 (ry+mz, no cond): ✓ {dict(list(r.items())[:2])}")
-except Exception as e:
-    print(f"  C1 ✗ {e}")
-
-# C2: + 第一個 if a2_0 or a2_1 條件
-@cudaq.kernel
-def k_c2(weights: list[float]):
-    q = cudaq.qvector(20)
-    ry(math.pi * weights[0], q[0])
-    x(q[1])
-    ry(math.pi * weights[2], q[2])
-    ry(math.pi * weights[4], q[3])
-    x.ctrl(q[0], q[1])
-    ry.ctrl(math.pi * weights[3], q[1], q[2])
-    x.ctrl(q[2], q[3])
-    ry.ctrl(math.pi * weights[1], q[0], q[1])
-    x.ctrl(q[1], q[2])
-    ry.ctrl(math.pi * weights[5], q[2], q[3])
-    a1_0 = mz(q[0])
-    a1_1 = mz(q[1])
-    a2_0 = mz(q[2])
-    a2_1 = mz(q[3])
-    if a2_0 or a2_1:
-        ry(math.pi * weights[6], q[4])
-        x(q[5])
-        x.ctrl(q[4], q[5])
-        ry.ctrl(math.pi * weights[7], q[4], q[5])
-    b21_0 = mz(q[4])
-    b21_1 = mz(q[5])
-
-try:
-    r = cudaq.sample(k_c2, [0.5]*134, shots_count=5)
-    print(f"  C2 (+ if a2_0 or a2_1): ✓ {dict(list(r.items())[:2])}")
-except Exception as e:
-    print(f"  C2 ✗ {e}")
-
-# C3: + Phase 2（包含 if a2_0: x(q[2]) 的 reset pattern）
-@cudaq.kernel
-def k_c3(weights: list[float]):
-    q = cudaq.qvector(20)
-    ry(math.pi * weights[0], q[0])
-    x(q[1])
-    ry(math.pi * weights[2], q[2])
-    ry(math.pi * weights[4], q[3])
-    x.ctrl(q[0], q[1])
-    ry.ctrl(math.pi * weights[3], q[1], q[2])
-    x.ctrl(q[2], q[3])
-    ry.ctrl(math.pi * weights[1], q[0], q[1])
-    x.ctrl(q[1], q[2])
-    ry.ctrl(math.pi * weights[5], q[2], q[3])
-    a1_0 = mz(q[0])
-    a1_1 = mz(q[1])
-    a2_0 = mz(q[2])
-    a2_1 = mz(q[3])
-    if a2_0 or a2_1:
-        ry(math.pi * weights[6], q[4])
-        x(q[5])
-        x.ctrl(q[4], q[5])
-        ry.ctrl(math.pi * weights[7], q[4], q[5])
-    b21_0 = mz(q[4])
-    b21_1 = mz(q[5])
-    # Phase 2 reset pattern
-    if a2_0:
-        x(q[2])
-    if a2_1:
-        x(q[3])
-    if b21_0:
-        x(q[4])
-    if b21_1:
-        x(q[5])
-    if a2_0 or a2_1:
-        ry(math.pi * weights[8],  q[2])
-        ry(math.pi * weights[9],  q[3])
-        ry.ctrl(math.pi * weights[10], q[2], q[3])
-    a3_0 = mz(q[2])
-    a3_1 = mz(q[3])
-
-try:
-    r = cudaq.sample(k_c3, [0.5]*134, shots_count=5)
-    print(f"  C3 (+ Phase 2 reset+atom3): ✓ {dict(list(r.items())[:2])}")
-except Exception as e:
-    print(f"  C3 ✗ {e}")
-
-# ── Test D：測試 make_qmg_n9_kernel 的 MLIR 是否能正常 compile ──────────
-print("\n[Test D] 嘗試強制 compile make_qmg_n9_kernel([0.5]*134)")
-try:
-    import gc
-    from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
-    kernel = make_qmg_n9_kernel([0.5] * 134)
-    kernel.compile()
-    print("  compile() 成功")
-    del kernel; gc.collect()
-except Exception as e:
-    print(f"  compile() 失敗：{e}")
-
-# ── Test E：完整 N=9 kernel 採樣驗證（GPU + CPU）─────────────────────────
-print("\n[Test E] 完整 N=9 kernel 採樣驗證（10 shots）")
-import gc, time
-from qmg.utils.build_dynamic_circuit_cudaq import make_qmg_n9_kernel
-
-for target in ["qpp-cpu", "nvidia"]:
-    print(f"\n  [Target: {target}]")
-    try:
-        cudaq.set_target(target)
-        kernel = make_qmg_n9_kernel([0.5] * 134)
-        t0 = time.time()
-        r = cudaq.sample(kernel, shots_count=10)
-        elapsed = time.time() - t0
-        items = dict(list(r.items())[:3])
-        print(f"  ✓ 成功：{items}  ({elapsed:.2f}s)")
-        # 驗證 bitstring 長度
-        sample_bs = list(r.items())
-        if sample_bs:
-            bs_len = len(sample_bs[0][0])
-            print(f"  bitstring 長度: {bs_len} (預期 ≤ 90)")
-        del kernel; gc.collect()
-    except Exception as e:
-        print(f"  ✗ 失敗：{e}")
-
-# ── Test F：查 sample.py 完整內容 ────────────────────────────────────────
-print("\n[Test F] sample.py 完整內容")
-import importlib.util, os
-spec = importlib.util.find_spec("cudaq")
-sample_py = os.path.join(os.path.dirname(spec.origin), "runtime", "sample.py")
-if os.path.exists(sample_py):
-    with open(sample_py) as f:
-        lines = f.readlines()
-    print(f"  共 {len(lines)} 行，前 40 行：")
-    for i, line in enumerate(lines[:40], 1):
-        print(f"  {i:4d} | {line}", end='')
-else:
-    print(f"  {sample_py} 不存在")
+    print(f"  ✗ {e}")
 
 print("\n" + "=" * 70)
-print("診斷完成 (v8.1)")
+print("診斷完成 (v9.2)")
 print("=" * 70)
