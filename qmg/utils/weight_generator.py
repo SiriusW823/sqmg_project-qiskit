@@ -26,15 +26,15 @@ class ConditionalWeightsGenerator():
         if smarts:
             # NOTE:
             #   The original interface uses `smarts` as parameter name in this project.
-            #   In practice users often pass mapped SMILES templates, but true SMARTS
-            #   should still be supported. Try SMARTS first, then fallback to SMILES.
-            self.mol = Chem.MolFromSmarts(smarts)
+            #   In practice users often pass mapped SMILES templates. We therefore
+            #   try SMILES first for backward compatibility, then fallback to SMARTS.
+            self.mol = Chem.MolFromSmiles(smarts)
             if self.mol is None:
-                self.mol = Chem.MolFromSmiles(smarts)
+                self.mol = Chem.MolFromSmarts(smarts)
             if self.mol is None:
                 raise ValueError(f"Invalid SMARTS / SMILES template: {smarts}")
             self.num_fixed_atoms = self.mol.GetNumAtoms()
-            Chem.Kekulize(self.mol, clearAromaticFlags=True)
+            Chem.KekulizeIfPossible(self.mol, clearAromaticFlags=True)
             self._initialize_maps()
             self._generate_constrained_parameters()
         else:
