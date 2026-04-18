@@ -1,36 +1,48 @@
 """
 ==============================================================================
-generator_cudaq.py  (CUDA-Q 0.7.1 / V100 sm_70 完整修正版 v9.4)
+generator_cudaq.py  (CUDA-Q 0.7.1 / V100 sm_70 完整修正版 v9.5)
 ==============================================================================
 
-v9.3 → v9.4 記憶體修正：
+v9.4 → v9.5 關鍵 Bug 修正：
 
-  ★ OOM Kill 根本原因（三層）：
+  ★ [BUG-FIX] _reconstruct_bitstrings_n9 型別判斷錯誤（V=0 根本原因）
 
-    [1] C++ heap 未歸還 OS（主因）
-        cudaq 0.7.1 的 SampleResult 透過 pybind11 繫結，
-        C++ 端的 heap 記憶體即使 Python del result 後也不會
-        歸還 OS。每次評估累積 ~50-90 MB 殘留，
-        202 次評估後耗盡 16 GB V100 系統記憶體。
-        修正：sample_molecule() 末段加入
-              del result → gc.collect() → malloc_trim(0)
+    症狀：
+      所有評估結果 V=0.000, U=0.000，所有 bitstring 為全 1（'111...1'）
 
-    [2] _reconstruct_bitstrings_n9 記憶體峰值過高
-        原版一次將 90 個 register × 10000 shots 全部讀入記憶體，
-        每次評估峰值約 90 * 10000 * Python字串物件 ≈ 80-120 MB。
-        修正：逐 register 讀取並立即丟棄，不保留整個 reg_data dict；
-              使用 bytearray 累積 bit，避免大量中間字串物件。
+    根本原因：
+      CUDA-Q 0.7.1 的 get_sequential_data() 回傳 list[str]，
+      每個元素是字串 '0' 或 '1'，而非 bool 或 int。
 
-    [3] QPSO history list 線性增長（輕微，不是主因）
-        不修改演算法邏輯，但已透過 generator 週期性重建緩解。
+      原版程式碼：
+        buf[i * 90] = 1 if bit else 0
+
+      Python 中非空字串皆為 truthy：
+        bool('0') == True   ← '0' 是非空字串，判斷為 True！
+        bool('1') == True
+      → 無論 bit 是 '0' 還是 '1'，都填入 1
+      → 所有 shot 的 90-bit bitstring 全部變成 '111...1'
+      → 全部轉換為無效分子 → validity = 0
+
+    修正：
+      buf[i * 90] = 1 if bit == '1' else 0
+      或等價：
+      buf[i * 90] = int(bit)   # '0'→0, '1'→1，直接轉型最安全
+
+  ★ [附帶修正] result.items() fallback 路徑
+    CUDA-Q nvidia target 的 result.items() 回傳 20-bit 全局 bitstring
+    （對應 20 個量子位元），不是 90-bit 命名暫存器串接。
+    舊版 fallback 判斷 len(bs_raw) == 90 永遠為 False，完全無效。
+    修正：fallback 路徑加入更詳細的診斷日誌，
+    主要重建路徑仍依賴 get_sequential_data（已知可回傳 90 個 register）。
+
+v9.4 修正保留：
+  - del result → gc.collect() → malloc_trim(0) 防止 OOM
+  - bytearray buffer 低記憶體模式
+  - 週期性 generator 重建支援
 
 v9.3 修正保留（分號 AST bug）：
     使用 build_dynamic_circuit_cudaq._qmg_n9（v9.1 分號修正版）
-    取代有問題的 _qmg_n9_v9，解決 list[float] broadcast dispatch 錯誤。
-
-速度對比（10000 shots，N=9）：
-  qpp-cpu  : ~90s/eval
-  nvidia   : ~1-5s/eval（V100 GPU + cuStateVec）
 ==============================================================================
 """
 from __future__ import annotations
@@ -53,7 +65,7 @@ from qmg.utils.build_dynamic_circuit_cudaq import DynamicCircuitBuilderCUDAQ, _q
 
 
 # ===========================================================================
-# 記憶體工具（v9.4 新增）
+# 記憶體工具
 # ===========================================================================
 
 def _free_cpp_heap() -> None:
@@ -122,8 +134,9 @@ def _check_cudaq_version_volta_compat() -> tuple[str, bool]:
 def _gpu_target_available() -> bool:
     try:
         for t in cudaq.get_targets():
-            name = str(t).split('\n')[0].replace('Target', '').strip()
-            if name == 'nvidia':
+            # 相容不同版本的 target 字串格式
+            t_str = str(t)
+            if 'nvidia' in t_str.lower():
                 return True
         return False
     except Exception:
@@ -175,54 +188,60 @@ def _set_target_safe(target_name: str) -> str:
 
 
 # ===========================================================================
-# 90-bit bitstring 重建（v9.4 低記憶體版）
+# 90-bit bitstring 重建（v9.5 型別修正版）
 # ===========================================================================
 
 def _reconstruct_bitstrings_n9(result) -> dict[str, int]:
     """
     用 90 個命名暫存器重建 bitstring。
 
-    v9.4 記憶體優化：
-      原版一次讀入所有 90 個 register list（reg_data dict），
-      在 Python heap 上同時持有 90 * n_shots 個字串物件，
-      高峰記憶體 ~80-120 MB（n_shots=10000）。
+    v9.5 關鍵修正：
+      CUDA-Q 0.7.1 的 get_sequential_data() 回傳 list[str]，
+      每個元素是字串 '0' 或 '1'，而非 bool 或 int。
 
-      優化方案：
-        1. 先取第一個 register 確認 n_shots
-        2. 預先建立一個 n_shots × 90 的 bytearray buffer
-        3. 逐 register 讀取後立即存入 buffer 並釋放 list
-        4. 從 bytearray 組裝 bitstring，計算 counts
-        5. 不保留整個 reg_data dict → 高峰記憶體降至 ~20-30 MB
+      原版：1 if bit else 0
+        → Python 非空字串皆為 truthy，'0' 也是 True
+        → '0' 和 '1' 都被轉為 1 → 全部 bitstring 變成 '111...1'
+
+      修正：int(bit)
+        → '0' → 0，'1' → 1，型別轉換語意明確且安全
+
+    記憶體優化（v9.4 保留）：
+      逐 register 讀取後立即 del，不保留整個 reg_data dict，
+      使用 bytearray buffer 避免大量中間字串物件。
     """
     try:
         # Step 1: 確認 n_shots
         first_data = result.get_sequential_data(_N9_ALL_REGS[0])
         n_shots = len(first_data)
         if n_shots == 0:
-            warnings.warn("[CUDAQ] n_shots=0。")
+            warnings.warn("[CUDAQ] n_shots=0，get_sequential_data 回傳空 list。")
             return {}
 
-        # Step 2: 預建 bytearray buffer（0=False/|0>, 1=True/|1>）
+        # Step 2: 預建 bytearray buffer
         # shape: n_shots × 90，每個 shot 佔 90 bytes
         buf = bytearray(n_shots * 90)
 
         # Step 3: 第 0 個 register 已讀入 first_data，直接填入
+        # ★ v9.5 修正：int(bit) 取代 1 if bit else 0
+        #   '0' → 0，'1' → 1
+        #   同時相容 str / bool / int 三種可能的回傳型別
         for i, bit in enumerate(first_data):
-            buf[i * 90] = 1 if bit else 0
+            buf[i * 90] = int(bit)
         del first_data  # 立即釋放
 
         # Step 4: 逐 register 讀取填入 buffer，不保留整個 dict
         for reg_idx, reg in enumerate(_N9_ALL_REGS[1:], start=1):
             reg_data = result.get_sequential_data(reg)
             for i, bit in enumerate(reg_data):
-                buf[i * 90 + reg_idx] = 1 if bit else 0
+                # ★ v9.5 修正：int(bit) 取代 1 if bit else 0
+                buf[i * 90 + reg_idx] = int(bit)
             del reg_data  # 立即釋放，不累積
 
         # Step 5: 從 buffer 組裝 bitstring 並計數
         counts: dict[str, int] = {}
         malformed = 0
         for i in range(n_shots):
-            # 直接從 bytearray slice 建立字串，避免 join 中間物件
             row = buf[i * 90: i * 90 + 90]
             if len(row) != 90:
                 malformed += 1
@@ -234,32 +253,48 @@ def _reconstruct_bitstrings_n9(result) -> dict[str, int]:
 
         if malformed:
             warnings.warn(f"[CUDAQ] {malformed}/{n_shots} shots bitstring 長度異常。")
+
+        # 診斷日誌：確認 bitstring 分布合理（非全 0 也非全 1）
+        if counts:
+            sample_bs = next(iter(counts))
+            ones_ratio = sample_bs.count('1') / 90
+            if ones_ratio > 0.95:
+                warnings.warn(
+                    f"[CUDAQ] 警告：bitstring 中 '1' 比例 = {ones_ratio:.2f}（過高，可能仍有型別問題）"
+                )
+            elif ones_ratio < 0.01:
+                warnings.warn(
+                    f"[CUDAQ] 警告：bitstring 中 '1' 比例 = {ones_ratio:.2f}（過低，可能量子電路未執行）"
+                )
+
         return counts
 
     except AttributeError:
-        # get_sequential_data() 不存在 → fallback to items()
-        warnings.warn("[CUDAQ] get_sequential_data() 不存在，使用 items() fallback。")
-        counts: dict[str, int] = {}
-        for bs_raw, cnt in result.items():
-            if len(bs_raw) == 90:
-                counts[bs_raw] = counts.get(bs_raw, 0) + cnt
-        return counts
+        # get_sequential_data() 不存在 → 記錄詳細診斷並回傳空
+        warnings.warn(
+            "[CUDAQ] get_sequential_data() 不存在。\n"
+            "  此 CUDA-Q 版本可能不支援命名暫存器讀取。\n"
+            "  result.items() 回傳的是全局 bitstring（20-bit），無法重建 90-bit 暫存器資料。\n"
+            "  請確認使用 CUDA-Q 0.7.1。"
+        )
+        return {}
     except Exception as e:
         warnings.warn(f"[CUDAQ] _reconstruct_bitstrings_n9 失敗：{e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
 # ===========================================================================
-# MoleculeGeneratorCUDAQ  (v9.4)
+# MoleculeGeneratorCUDAQ  (v9.5)
 # ===========================================================================
 
 class MoleculeGeneratorCUDAQ:
-    """CUDA-Q 版分子生成器（CUDA-Q 0.7.1 / V100 sm_70，v9.4）。
+    """CUDA-Q 版分子生成器（CUDA-Q 0.7.1 / V100 sm_70，v9.5）。
 
-    v9.4 記憶體修正（OOM Kill 修復）：
-      1. sample_molecule() 結尾加入 del result → gc.collect() → malloc_trim(0)
-      2. _reconstruct_bitstrings_n9 改為低記憶體逐 register 讀取模式
-      3. sample_molecule() 結尾加入 smiles 處理後的中間物件釋放
+    v9.5：修正 _reconstruct_bitstrings_n9 的型別判斷 bug（V=0 根本原因）。
+    v9.4：修正 OOM Kill（del result + gc.collect + malloc_trim）。
+    v9.3：修正 list[float] broadcast dispatch 錯誤（分號 AST bug）。
     """
 
     def __init__(
@@ -304,12 +339,12 @@ class MoleculeGeneratorCUDAQ:
 
         ver_str, _ = _check_cudaq_version_volta_compat()
         print(
-            f"[CUDAQ] Generator initialized (v9.4).\n"
+            f"[CUDAQ] Generator initialized (v9.5).\n"
             f"  cudaq version  : {ver_str}\n"
             f"  active target  : {self._active_target}\n"
             f"  GPU available  : {_gpu_target_available()}\n"
             f"  kernel         : _qmg_n9 (v9.1 semicolon-free)\n"
-            f"  reconstruction : 90 named registers (low-memory mode)\n"
+            f"  reconstruction : 90 named registers (v9.5 int(bit) fix)\n"
             f"  memory mgmt    : malloc_trim enabled ✓"
         )
 
@@ -331,11 +366,10 @@ class MoleculeGeneratorCUDAQ:
         # ── 量子電路採樣 ─────────────────────────────────────────────────
         result = cudaq.sample(self._kernel, w_list, shots_count=num_sample)
 
-        # ── bitstring 重建（低記憶體逐 register 模式）────────────────────
+        # ── bitstring 重建（低記憶體 + v9.5 型別修正）────────────────────
         raw_counts = _reconstruct_bitstrings_n9(result)
 
         # ★ v9.4 Fix-1：明確刪除 result，觸發 C++ SampleResult 析構
-        #   不能依賴 GC 時機，必須立即 del
         del result
         del w_list
         gc.collect()
@@ -374,7 +408,7 @@ MoleculeGenerator = MoleculeGeneratorCUDAQ
 # ===========================================================================
 if __name__ == "__main__":
     import time
-    print("=== MoleculeGeneratorCUDAQ 功能驗證 (v9.4) ===")
+    print("=== MoleculeGeneratorCUDAQ 功能驗證 (v9.5) ===")
     ver_str, is_compat = _check_cudaq_version_volta_compat()
     print(f"CUDA-Q: {ver_str}  V100 compat: {'✓' if is_compat else '⚠'}")
     print(f"GPU target 可用: {_gpu_target_available()}")
