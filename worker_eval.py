@@ -1,20 +1,26 @@
 """
 ==============================================================================
-worker_eval.py — 子行程評估工作者（v10.0 更新）
+worker_eval.py — 子行程評估工作者（v10.1 修正版）
 ==============================================================================
 
-v9.6 → v10.0 更新：
-  - 新增 tensornet / tensornet-mps / nvidia-mqpu / nvidia-mgpu 後端支援
-  - 改善錯誤訊息輸出（exit code 1 時印出完整 traceback）
+v10.0 → v10.1 修正：
+
+  ★ [BUG-FIX] 雙重 chemistry constraint 問題：
+      v10.0 中，run_qpso_qmg_cudaq.py 的 evaluate_fn 在儲存 weight 前
+      已呼叫過 cwg.apply_chemistry_constraint(pos.copy())，
+      但 worker_eval.py 載入後又再呼叫一次 apply_chemistry_constraint。
+      
+      apply_chemistry_constraint 不是冪等函式（non-idempotent）：
+        第一次：對 softmax 前的原始隨機值做 softmax_temperature
+        第二次：對已 softmax 過的值再做一次 softmax_temperature
+        結果：機率分佈進一步向最大值集中，破壞 QPSO 的參數空間探索能力
+        
+      修正：worker 直接使用主行程已處理過的 constrained weights，
+      不再重複套用 chemistry constraint。
 
 說明：
-  此檔案供 run_qpso_qmg_cudaq.py（v9.6 subprocess 版）使用。
+  此檔案供 run_qpso_qmg_cudaq.py（v9.6/v10.x subprocess 版）使用。
   若使用 run_qpso_qmg_mpi.py（MPI 版），不需要此檔案。
-
-  MPI 版優勢：
-    - 不需要 subprocess，零 process 啟動開銷
-    - CUDA context 隔離由 MPI rank 保證
-    - tensornet 後端速度優勢完全發揮
 
 放置位置：worker_eval.py（專案根目錄）
 ==============================================================================
@@ -44,7 +50,7 @@ SUPPORTED_BACKENDS = [
 
 
 def main():
-    p = argparse.ArgumentParser(description="QMG worker_eval (v10.0)")
+    p = argparse.ArgumentParser(description="QMG worker_eval (v10.1)")
     p.add_argument("--weight_path",    type=str, required=True)
     p.add_argument("--result_path",    type=str, required=True)
     p.add_argument("--num_heavy_atom", type=int, default=9)
@@ -53,25 +59,38 @@ def main():
                    choices=SUPPORTED_BACKENDS)
     args = p.parse_args()
 
-    # 預設失敗輸出
+    # 預設失敗輸出（確保 result_path 在任何錯誤情況下都存在）
     np.save(args.result_path, np.array([0.0, 0.0], dtype=np.float64))
 
     try:
         from qmg.generator_cudaq import MoleculeGeneratorCUDAQ
-        from qmg.utils.weight_generator import ConditionalWeightsGenerator
 
+        # ★ v10.1 修正：
+        #   主行程（run_qpso_qmg_cudaq.py）在儲存前已呼叫：
+        #     w_constrained = cwg.apply_chemistry_constraint(pos.copy())
+        #     np.save(weight_path, w_constrained)
+        #   因此此處直接載入，不再重複套用 chemistry constraint。
+        #
+        #   舊版（v10.0）錯誤流程：
+        #     w = np.load(...)                               # 已 constrained
+        #     cwg = ConditionalWeightsGenerator(...)
+        #     w_constrained = cwg.apply_chemistry_constraint(w.copy())  # 第二次！
+        #     gen = MoleculeGeneratorCUDAQ(..., chemistry_constraint=True)
+        #
+        #   新版（v10.1）正確流程：
+        #     w = np.load(...)                               # 已 constrained
+        #     gen = MoleculeGeneratorCUDAQ(..., chemistry_constraint=False)
         w = np.load(args.weight_path)
         assert len(w) == 134, f"weight 長度錯誤：{len(w)}，期待 134"
 
-        cwg = ConditionalWeightsGenerator(args.num_heavy_atom, smarts=None)
-        w_constrained = cwg.apply_chemistry_constraint(w.copy())
-
         gen = MoleculeGeneratorCUDAQ(
             num_heavy_atom            = args.num_heavy_atom,
-            all_weight_vector         = w_constrained,
+            all_weight_vector         = w,
             backend_name              = args.backend,
             remove_bond_disconnection = True,
-            chemistry_constraint      = True,
+            # ★ v10.1 關鍵修正：設為 False，避免 generator 內部再套用一次
+            #   主行程的 evaluate_fn 已套用，此處不需要重複
+            chemistry_constraint      = False,
         )
 
         _, validity, uniqueness = gen.sample_molecule(args.num_sample)
